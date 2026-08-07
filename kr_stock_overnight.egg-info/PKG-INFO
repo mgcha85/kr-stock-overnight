@@ -1,0 +1,54 @@
+Metadata-Version: 2.4
+Name: kr-stock-overnight
+Version: 0.1.0
+Summary: KRX Stock Market Overnight Strategy Research & Scoring Engine
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: polars>=0.20.0
+Requires-Dist: pandas>=2.0.0
+Requires-Dist: requests>=2.31.0
+Requires-Dist: google-generativeai>=0.4.0
+Requires-Dist: pydantic>=2.0.0
+Requires-Dist: scikit-learn>=1.3.0
+Requires-Dist: tabulate>=0.9.0
+Requires-Dist: python-dotenv>=1.0.0
+Requires-Dist: lightgbm>=4.0.0
+Requires-Dist: torch>=2.0.0
+Requires-Dist: pyarrow>=14.0.0
+
+# KRX Stock Overnight Strategy (한국 주식 오버나이트 전략)
+
+A research pipeline and execution system for Korean Stock Market Overnight (종가 베팅) trading strategies using multi-source data (News, DART, Themes, Candle/Turnover).
+
+## Core Principles & Engineering Standards
+1. **Data Analysis**: `Polars` for fast multi-threaded dataframe processing.
+2. **Storage Format**: `Parquet` (.parquet) format stored in `data/` directory.
+3. **Analytics DB**: `DuckDB` / SQLite for fast query and interface connection.
+4. **Time Contract**: Explicit `open_time` (09:00:00) & `close_time` (15:30:00) to eliminate Look-ahead bias.
+
+Detailed documentation: [docs/DATA_ENGINEERING_RULES.md](docs/DATA_ENGINEERING_RULES.md)
+
+## Features
+- Multi-Factor Scoring Model (Technical, Theme, Gemini 3.0 Flash News/DART NLP, Risk/Macro)
+- Time-partitioned Candle Data Pipeline (`open_time` & `close_time` explicit timestamps)
+- Train / Validation / Test Walk-forward Backtesting against Buy & Hold (B&H) benchmark
+- Live Trading Engine in Go + Container deployment via Podman-compose
+
+## Execution Guide
+```bash
+# 1. Install dependencies
+uv sync
+
+# 2. Prepare kline data (Extract, transform with open_time/close_time, save to data/)
+uv run python research/prepare_kline_data.py
+
+# 3. Run Walk-forward backtest (Train / Validation / Test vs Buy & Hold)
+uv run python research/backtest_overnight_splits.py
+```
+
+## Documentation
+- Strategy Specification: [docs/OVERNIGHT_STRATEGY_SPEC.md](docs/OVERNIGHT_STRATEGY_SPEC.md)
+- Walk-forward Results: [docs/BACKTEST_WALKFORWARD_RESULTS.md](docs/BACKTEST_WALKFORWARD_RESULTS.md)
+- Data Engineering Rules: [docs/DATA_ENGINEERING_RULES.md](docs/DATA_ENGINEERING_RULES.md)
+- Architecture Overview: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- Roadmap / TODO: [docs/TODO.md](docs/TODO.md)

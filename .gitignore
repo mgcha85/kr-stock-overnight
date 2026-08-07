@@ -1,0 +1,26 @@
+# Sensitive Environment Files (RULE 1)
+.env
+.env.dev
+.env.prod
+.env.*
+!.env.example
+
+# Databases & Data Files
+*.db
+data/*.parquet
+data/
+
+# Dependencies & Build Files
+node_modules/
+dist/
+.svelte-kit/
+target/
+__pycache__/
+*.pyc
+.venv/
+.uv/
+
+# Logs & Temporary Files
+*.log
+tmp/
+.ds_store

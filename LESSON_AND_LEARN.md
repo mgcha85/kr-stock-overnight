@@ -1,0 +1,1 @@
+/mnt/data/projects/harness-collection/finance/LESSON_AND_LEARN.md

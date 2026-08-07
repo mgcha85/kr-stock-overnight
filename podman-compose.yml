@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  kr_stock_paper_trading:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kr_stock_paper_trading
+    restart: always
+    volumes:
+      - ./data:/app/data
+      - /mnt/data/projects/marketMosaic/backend/data:/mnt/data/projects/marketMosaic/backend/data:ro
+      - /mnt/data/finance:/mnt/data/finance:ro
+    env_file:
+      - .env.${ENV_TYPE:-dev}
+    environment:
+      - PYTHONPATH=/app/src
+    networks:
+      - kr_stock_net
+
+networks:
+  kr_stock_net:
+    driver: bridge
