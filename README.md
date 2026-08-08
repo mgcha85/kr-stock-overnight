@@ -11,7 +11,7 @@ A research pipeline and execution system for Korean Stock Market Overnight (ì¢…ê
 Detailed documentation: [docs/DATA_ENGINEERING_RULES.md](docs/DATA_ENGINEERING_RULES.md)
 
 ## Features
-- Multi-Factor Scoring Model (Technical, Theme, Gemini 3.0 Flash News/DART NLP, Risk/Macro)
+- Multi-Factor Scoring Model (Technical, Theme, OpenRouter Free AI Model Round-Robin NLP Evaluator via `OPEN_ROUTER_API_KEY`, Risk/Macro)
 - Time-partitioned Candle Data Pipeline (`open_time` & `close_time` explicit timestamps)
 - Train / Validation / Test Walk-forward Backtesting against Buy & Hold (B&H) benchmark
 - Live Trading Engine in Go + Container deployment via Podman-compose
