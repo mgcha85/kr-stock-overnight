@@ -56,6 +56,7 @@ class DeepOvernightNet(nn.Module):
 def compute_kline_features(df_candles: pd.DataFrame) -> pd.DataFrame:
     """Computes technical indicator features from candle OHLCV data."""
     df = df_candles.copy()
+    df = df.sort_values(by=['ticker', 'date']).reset_index(drop=True)
     
     # 1. Price Action Features
     high_low_range = df['high'] - df['low'] + 1e-5

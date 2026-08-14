@@ -15,16 +15,17 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 # Copy dependency definition files
 COPY pyproject.toml uv.lock ./
 
-# Synchronize dependencies
-RUN uv sync --frozen
+# Synchronize dependencies (FinanceDataReader required for 15:20 candle sync / 09:00 opens)
+RUN uv sync --frozen && uv run python -c "import FinanceDataReader"
 
-# Copy source code and research models
+# Copy source code, scripts, and research models
 COPY src ./src
 COPY research ./research
+COPY scripts ./scripts
 COPY docs ./docs
 
-# Set PYTHONPATH
-ENV PYTHONPATH=/app/src
+# Set PYTHONPATH (compose may override to include /app for scripts)
+ENV PYTHONPATH=/app/src:/app
 
 # Default entrypoint command: daemon scheduler
 CMD ["uv", "run", "python", "-m", "kr_stock.scheduler"]

@@ -15,6 +15,8 @@ Requires-Dist: python-dotenv>=1.0.0
 Requires-Dist: lightgbm>=4.0.0
 Requires-Dist: torch>=2.0.0
 Requires-Dist: pyarrow>=14.0.0
+Requires-Dist: finance-datareader>=0.9.50
+Requires-Dist: websocket-client>=1.9.0
 
 # KRX Stock Overnight Strategy (한국 주식 오버나이트 전략)
 
@@ -29,7 +31,7 @@ A research pipeline and execution system for Korean Stock Market Overnight (종�
 Detailed documentation: [docs/DATA_ENGINEERING_RULES.md](docs/DATA_ENGINEERING_RULES.md)
 
 ## Features
-- Multi-Factor Scoring Model (Technical, Theme, Gemini 3.0 Flash News/DART NLP, Risk/Macro)
+- Multi-Factor Scoring Model (Technical, Theme, OpenRouter Free AI Model Round-Robin NLP Evaluator via `OPEN_ROUTER_API_KEY`, Risk/Macro)
 - Time-partitioned Candle Data Pipeline (`open_time` & `close_time` explicit timestamps)
 - Train / Validation / Test Walk-forward Backtesting against Buy & Hold (B&H) benchmark
 - Live Trading Engine in Go + Container deployment via Podman-compose

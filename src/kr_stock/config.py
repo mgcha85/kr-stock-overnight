@@ -39,3 +39,19 @@ JUDAL_DB_PATH = Path(os.getenv("JUDAL_DB_PATH", "/mnt/data/projects/marketMosaic
 SECTOR_DB_PATH = Path(os.getenv("SECTOR_DB_PATH", "/mnt/data/finance/candles/KO/sector_info.db"))
 BACKTEST_DB_PATH = Path(os.getenv("BACKTEST_DB_PATH", "/mnt/data/finance/backtest_results.db"))
 DASHBOARD_API_URL = os.getenv("DASHBOARD_API_URL", "http://146.56.115.71:8082/api/backtest")
+
+# paper = DB-only fills. live = Kiwoom kt10000/kt10001 orders.
+# EXECUTION_LIVE=1 is an alias for TRADING_MODE=live.
+_TRADING_MODE_RAW = os.getenv("TRADING_MODE", "paper").strip().lower()
+if str(os.getenv("EXECUTION_LIVE", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+    _TRADING_MODE_RAW = "live"
+TRADING_MODE = "live" if _TRADING_MODE_RAW in {"live", "on", "1", "true"} else "paper"
+ACC_NO = os.getenv("ACC_NO") or os.getenv("ACC_ID") or os.getenv("KIWOOM_ACC_NO") or ""
+
+
+def is_live_execution() -> bool:
+    return TRADING_MODE == "live"
+
+
+def execution_mode_tag() -> str:
+    return "LIVE" if is_live_execution() else "PAPER"

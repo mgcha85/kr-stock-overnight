@@ -9,12 +9,14 @@ services:
     restart: always
     volumes:
       - ./data:/app/data
+      - ./src:/app/src:ro
+      - ./scripts:/app/scripts:ro
       - /mnt/data/projects/marketMosaic/backend/data:/mnt/data/projects/marketMosaic/backend/data:ro
-      - /mnt/data/finance:/mnt/data/finance:ro
+      - /mnt/data/finance:/mnt/data/finance
     env_file:
       - .env.${ENV_TYPE:-dev}
     environment:
-      - PYTHONPATH=/app/src
+      - PYTHONPATH=/app/src:/app
     networks:
       - kr_stock_net
 

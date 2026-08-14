@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT_DIR))
 sys.path.insert(0, str(ROOT_DIR / "src"))
 
 from kr_stock.inference import OvernightScorer
@@ -50,9 +51,11 @@ def run_parity_test():
 
         all_match = True
         for c1, c2 in zip(run1, run2):
-            if c1['ticker'] != c2['ticker']:
+            t1 = c1.get('code', c1.get('ticker'))
+            t2 = c2.get('code', c2.get('ticker'))
+            if t1 != t2:
                 all_match = False
-                print(f"  [FAIL] Ticker mismatch: {c1['ticker']} vs {c2['ticker']}")
+                print(f"  [FAIL] Ticker mismatch: {t1} vs {t2}")
             if abs(c1['hybrid_score'] - c2['hybrid_score']) > 1e-5:
                 all_match = False
                 print(f"  [FAIL] Score mismatch: {c1['hybrid_score']} vs {c2['hybrid_score']}")
@@ -64,7 +67,8 @@ def run_parity_test():
             passed_checks += 1
             print(f"  [PASS] 100% Deterministic Parity Verified for {dt}!")
             for idx, c in enumerate(run1, 1):
-                print(f"    Rank #{idx}: [{c['ticker']}] {c['stock_name']} ({c['theme_name']}) | Score: {c['hybrid_score']:.2f} | P(LGB): {c['p_lgb']:.4f} | P(MLP): {c['p_torch']:.4f}")
+                t_code = c.get('code', c.get('ticker'))
+                print(f"    Rank #{idx}: [{t_code}] {c['stock_name']} ({c['theme_name']}) | Score: {c['hybrid_score']:.2f} | P(LGB): {c['p_lgb']:.4f} | P(MLP): {c['p_torch']:.4f}")
 
     print("\n" + "="*80)
     print(f"PARITY VERIFICATION RESULT: {passed_checks} / {total_checks} PASSED ({passed_checks/total_checks:.0%})")

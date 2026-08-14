@@ -1,4 +1,6 @@
 data
 docs
+live-trading
 research
+scripts
 src

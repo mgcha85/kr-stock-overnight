@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT_DIR))
 sys.path.insert(0, str(ROOT_DIR / "src"))
 
 from kr_stock.inference import OvernightScorer

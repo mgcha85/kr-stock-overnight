@@ -2,7 +2,7 @@
 Telegram Bot Messaging Helper for KRX Paper-Trading Engine
 ----------------------------------------------------------
 Sends real-time alerts for:
-- Market Close BUY entries (15:30)
+- Market Close BUY entries (15:20)
 - Market Open SELL exits (09:00)
 - Post-Trade Weekly & Monthly Returns Summary
 - Daily Backtest Parity Verification Report
@@ -11,7 +11,7 @@ Sends real-time alerts for:
 import requests
 import logging
 from typing import List, Dict, Any
-from kr_stock.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from kr_stock.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, execution_mode_tag
 
 logger = logging.getLogger(__name__)
 
@@ -44,23 +44,40 @@ def send_telegram_message(message: str) -> bool:
         return False
 
 
+def send_ops_error_alert(date_str: str, title: str, details: str) -> bool:
+    """Failure that must not be reported as a normal empty-buy / fee-only sell."""
+    msg = (
+        f"<b>🚨 [{execution_mode_tag()}] [KRX Overnight] {title}</b>\n"
+        f"🗓️ <b>일자:</b> {date_str}\n"
+        "────────────────────────\n"
+        f"{details}\n"
+        "────────────────────────\n"
+        "<i>가짜 매수없음/가짜 -0.23% 청산은 하지 않았습니다. 원인 해결 후 재실행하세요.</i>"
+    )
+    return send_telegram_message(msg)
+
+
 def send_market_close_buy_alert(
     date_str: str,
     buys: List[Dict[str, Any]],
     capital_per_stock: float,
     cash_remaining: float,
-    total_equity: float
+    total_equity: float,
+    empty_reason: str = "",
 ) -> bool:
-    """Formats and sends the 15:30 Market Close BUY notification."""
+    """Formats and sends the 15:20 Market Close BUY notification."""
     lines = [
-        "<b>📈 [KRX Overnight Strategy] 장 마감 매수 내역 (15:30)</b>",
+        f"<b>📈 [{execution_mode_tag()}] [KRX Overnight Strategy] 장 마감 매수 내역 (15:20)</b>",
         f"🗓️ <b>일자:</b> {date_str}",
         f"💵 <b>설정 시드:</b> {total_equity:,.0f} 원 | <b>종목당 배정:</b> {capital_per_stock:,.0f} 원",
         "────────────────────────"
     ]
 
     if not buys:
-        lines.append("⚠️ <b>매수 조건 충족 종목 없음 (Cash 100% 보유)</b>")
+        if empty_reason:
+            lines.append(f"⚠️ <b>매수 없음</b>\n   {empty_reason}")
+        else:
+            lines.append("⚠️ <b>매수 조건 충족 종목 없음 (필터 통과 종목 0)</b>")
     else:
         for idx, b in enumerate(buys, 1):
             lines.append(
@@ -93,7 +110,7 @@ def send_market_open_sell_alert(
     """Formats and sends the 09:00 Market Open SELL & Returns notification."""
     pnl_icon = "🚀" if daily_pnl_krw >= 0 else "🔻"
     lines = [
-        f"<b>{pnl_icon} [KRX Overnight Strategy] 장 시작 매도 및 수익률 보고 (09:00)</b>",
+        f"<b>{pnl_icon} [{execution_mode_tag()}] [KRX Overnight Strategy] 장 시작 매도 및 수익률 보고 (09:00)</b>",
         f"🗓️ <b>일자:</b> {date_str}",
         "────────────────────────"
     ]
@@ -130,10 +147,16 @@ def send_parity_check_alert(
     details: str = ""
 ) -> bool:
     """Formats and sends the post-market Backtest vs Paper Trading parity verification report."""
-    status_icon = "✅ [100% PARITY MATCH]" if is_matched else "⚠️ [PARITY MISMATCH DETECTED]"
+    both_empty = (not paper_tickers) and (not backtest_tickers)
+    if both_empty:
+        status_icon = "ℹ️ [양쪽 매수 없음]"
+    elif is_matched:
+        status_icon = "✅ [100% PARITY MATCH]"
+    else:
+        status_icon = "⚠️ [PARITY MISMATCH DETECTED]"
     
     lines = [
-        f"<b>{status_icon} 장후 백테스트 ↔ 페이퍼트레이딩 검증 보고</b>",
+        f"<b>{status_icon} [{execution_mode_tag()}] 장후 백테스트 ↔ 페이퍼트레이딩 검증 보고</b>",
         f"🗓️ <b>검증 일자:</b> {date_str}",
         f"📌 <b>Paper Trading 매수:</b> {', '.join(paper_tickers) if paper_tickers else '없음'}",
         f"🔍 <b>Backtest 정답 매수:</b> {', '.join(backtest_tickers) if backtest_tickers else '없음'}",

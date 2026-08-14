@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import joblib
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from kr_stock.config import (
     MODEL_DIR, DATA_PARQUET_PATH, JUDAL_DB_PATH, SECTOR_DB_PATH, FEE_RATE
@@ -211,12 +211,18 @@ class OvernightScorer:
         min_turnover: float = 2e10,
         max_stock_change: float = 29.0,
         min_p_lgb: float = 0.35,
-        min_p_torch: float = 0.35
+        min_p_torch: float = 0.35,
+        candidate_codes: Optional[List[str]] = None
     ) -> List[Dict[str, Any]]:
         """
         Calculates hybrid scores for target_date and returns top_k candidate stocks.
+        If candidate_codes is provided (e.g. from Kiwoom Condition Search '종가베팅'),
+        only fetches and analyzes candles for those candidate stocks.
         Guarantees exact parity between Backtest and Paper Trading.
         """
+        # Clean candidate codes if provided
+        clean_candidates = [str(c).split('.')[0].zfill(6) for c in candidate_codes] if candidate_codes is not None else None
+
         # 1. Judal Theme & Stock History
         conn_judal = sqlite3.connect(str(JUDAL_DB_PATH))
         df_hist = pd.read_sql_query("""
@@ -228,6 +234,13 @@ class OvernightScorer:
         if df_hist.empty:
             conn_judal.close()
             return []
+
+        if clean_candidates is not None:
+            df_hist['code'] = df_hist['code'].apply(lambda x: str(x).split('.')[0].zfill(6))
+            df_hist = df_hist[df_hist['code'].isin(clean_candidates)].copy()
+            if df_hist.empty:
+                conn_judal.close()
+                return []
 
         df_ts = pd.read_sql_query("SELECT theme_idx, stock_code as code FROM theme_stocks", conn_judal)
         df_themes = pd.read_sql_query("SELECT theme_idx, name as theme_name FROM themes", conn_judal)
@@ -252,9 +265,16 @@ class OvernightScorer:
             start_date_calc = "2026-01-01"
 
         lazy_df = pl.scan_parquet(str(DATA_PARQUET_PATH))
+        
+        # Filter candles for specified candidate_codes if provided
+        candle_filter = (pl.col("date") >= start_date_calc) & (pl.col("date") <= target_date)
+        if clean_candidates is not None:
+            # Match 6-digit stock code
+            candle_filter = candle_filter & (pl.col("ticker").str.slice(0, 6).is_in(clean_candidates))
+
         df_candles = (
             lazy_df
-            .filter((pl.col("date") >= start_date_calc) & (pl.col("date") <= target_date))
+            .filter(candle_filter)
             .select(["date", "ticker", "open", "close", "high", "low", "turnover", "high_close_ratio", "next_open"])
             .collect()
             .to_pandas()
@@ -276,7 +296,9 @@ class OvernightScorer:
         if self.is_mtf:
             df_intra = load_intraday_15m_features_for_date(target_date)
             if not df_intra.empty:
-                merged = pd.merge(merged, df_intra, on=['code', 'date'], how='inner')
+                merged = pd.merge(merged, df_intra, on=['code', 'date'], how='left')
+                for col in MTF_INTRA_COLS:
+                    merged[col] = merged[col].fillna(0.0)
             else:
                 for col in MTF_INTRA_COLS:
                     merged[col] = 0.0
@@ -345,6 +367,7 @@ class OvernightScorer:
 
             results.append({
                 "date": target_date,
+                "code": code,
                 "ticker": code,
                 "stock_name": stock_name,
                 "theme_name": str(row['theme_name']),

@@ -12,6 +12,7 @@ import argparse
 import sys
 from datetime import datetime
 from kr_stock.paper_engine import PaperTradingEngine
+from kr_stock.config import TRADING_MODE
 
 
 def main():
@@ -20,7 +21,7 @@ def main():
         "--mode",
         choices=["buy", "sell", "parity", "full_day"],
         required=True,
-        help="Trading mode to execute: buy (15:30 close), sell (09:00 open), parity (verification), full_day (simulation)"
+        help="Trading mode to execute: buy (15:20 close), sell (09:00 open), parity (verification), full_day (simulation)"
     )
     parser.add_argument(
         "--date",
@@ -33,7 +34,7 @@ def main():
     engine = PaperTradingEngine()
 
     print(f"=========================================================================")
-    print(f"   KRX PAPER TRADING ENGINE | Mode: {args.mode.upper()} | Date: {args.date}")
+    print(f"   KRX OVERNIGHT ENGINE | Exec: {TRADING_MODE.upper()} | Mode: {args.mode.upper()} | Date: {args.date}")
     print(f"=========================================================================\n")
 
     if args.mode == "buy":
@@ -53,7 +54,7 @@ def main():
         sells = engine.execute_market_open_sell(args.date)
         print(f"Closed {len(sells)} positions.\n")
 
-        print(f"--- 2. Executing Afternoon 15:30 BUY ---")
+        print(f"--- 2. Executing Afternoon 15:20 BUY ---")
         buys = engine.execute_market_close_buy(args.date)
         print(f"Opened {len(buys)} positions.\n")
 

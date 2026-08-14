@@ -154,8 +154,7 @@ def run_full_rolling_backtest():
                 (day_cands['turnover'] >= 2e10) & 
                 (day_cands['stock_change'] < 29.0) &  # Upper Limit Filter
                 (day_cands['p_lgb'] >= 0.35) & 
-                (day_cands['p_torch'] >= 0.35) &
-                (abs(day_cands['next_open'] / day_cands['close'] - 1) < 0.25)
+                (day_cands['p_torch'] >= 0.35)
             ]
             if day_cands.empty:
                 daily_returns.append(0.0)
@@ -164,6 +163,8 @@ def run_full_rolling_backtest():
             top_picks = day_cands.sort_values(by='hybrid_score', ascending=False).head(3)
             day_pnls = []
             for idx, row in top_picks.iterrows():
+                if pd.isna(row['next_open']) or row['next_open'] <= 0:
+                    continue
                 code = row['code']
                 stock_name = row['stock_name']
                 ctx = integrator.get_full_market_context(code, stock_name, d)
