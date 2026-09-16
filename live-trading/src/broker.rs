@@ -10,7 +10,7 @@ use crate::kiwoom::{
     AccountService, HoldingItem, KiwoomAuth, KiwoomClient, OrderApi, OrderResponse,
 };
 
-fn block_on<T>(fut: impl Future<Output = T>) -> T {
+pub(crate) fn block_on<T>(fut: impl Future<Output = T>) -> T {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
         Err(_) => tokio::runtime::Runtime::new()
@@ -119,6 +119,14 @@ impl LiveBroker {
             warn!("LIVE BUY rejected {code} qty={qty} code={:?} msg={msg}", resp.return_code);
         }
         Ok((ok, ord_no, msg))
+    }
+
+    pub fn session_open(&self, ticker: &str) -> Result<f64> {
+        use crate::kiwoom::MarketDataService;
+        let token = self.token()?;
+        let code = zfill6(ticker);
+        let market = MarketDataService::new(KiwoomClient::from_env());
+        block_on(market.get_open_price(&token, &code)).map_err(|e| anyhow!("ka10001 open {code}: {e}"))
     }
 
     pub fn market_sell(&self, ticker: &str, qty: i32) -> Result<(bool, String, String)> {

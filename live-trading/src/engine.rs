@@ -7,13 +7,16 @@ use chrono::Local;
 use polars::prelude::*;
 use rusqlite::{params, Connection};
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::broker::LiveBroker;
 use crate::candles::ensure_today_updated;
 use crate::condition::KiwoomConditionManager;
 use crate::config::{Config, SEED_CAPITAL};
+use crate::dashboard::{apply_remote_trading_mode, sync_book};
+use crate::quotes::SessionCloseMode;
 use crate::scoring::{OvernightScorer, Pick};
+use crate::sizing::size_overnight_picks;
 use crate::telegram::{
     send_market_close_buy_alert, send_market_open_sell_alert, send_ops_error_alert,
     send_parity_check_alert,
@@ -88,6 +91,7 @@ impl PaperTradingEngine {
         let _ = conn.execute("ALTER TABLE paper_trades ADD COLUMN buy_ord_no TEXT", []);
         let _ = conn.execute("ALTER TABLE paper_trades ADD COLUMN sell_ord_no TEXT", []);
         let _ = conn.execute("ALTER TABLE paper_trades ADD COLUMN execution_mode TEXT", []);
+        let _ = conn.execute("ALTER TABLE paper_trades ADD COLUMN trading_mode TEXT", []);
         Ok(())
     }
 
@@ -102,9 +106,10 @@ impl PaperTradingEngine {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .ok();
+        let mode = &self.cfg.trading_mode;
         let open_invested: f64 = conn.query_row(
-            "SELECT COALESCE(SUM(buy_amount), 0.0) FROM paper_trades WHERE status = 'OPEN'",
-            [],
+            "SELECT COALESCE(SUM(buy_amount), 0.0) FROM paper_trades WHERE status = 'OPEN' AND (trading_mode = ?1 OR execution_mode = ?1)",
+            [mode],
             |r| r.get(0),
         )?;
         if let Some((cash, _, _)) = row {
@@ -214,11 +219,13 @@ impl PaperTradingEngine {
     }
 
     pub fn execute_market_close_buy(&mut self, target_date: &str) -> Result<Vec<serde_json::Value>> {
+        apply_remote_trading_mode(&mut self.cfg);
         let (cash, _invested, total_equity) = self.get_latest_account_state()?;
 
+        let mode = &self.cfg.trading_mode;
         let existing: i64 = self.conn()?.query_row(
-            "SELECT COUNT(*) FROM paper_trades WHERE date = ? AND status = 'OPEN'",
-            [target_date],
+            "SELECT COUNT(*) FROM paper_trades WHERE date = ? AND status = 'OPEN' AND (trading_mode = ?2 OR execution_mode = ?2)",
+            params![target_date, mode],
             |r| r.get(0),
         )?;
         if existing > 0 {
@@ -226,9 +233,9 @@ impl PaperTradingEngine {
             return Ok(vec![]);
         }
 
-        ensure_today_updated(&self.cfg, target_date).map_err(|e| {
-            anyhow::anyhow!("candle sync failed for {target_date}: {e}")
-        })?;
+        if let Err(e) = ensure_today_updated(&self.cfg, target_date) {
+            warn!("[candles] Parquet check warning for {target_date}: {e}. Proceeding with live candidate search.");
+        }
 
         let candidate_codes = self
             .condition_manager
@@ -236,13 +243,13 @@ impl PaperTradingEngine {
         let picks = self.scorer.get_candidates_for_date(
             target_date,
             self.cfg.top_k,
-            2e10,
+            0.0,
             29.0,
             0.35,
             0.35,
             Some(&candidate_codes),
+            SessionCloseMode::Expected,
         )?;
-
         if picks.is_empty() {
             info!("[{target_date}] No candidates met scoring threshold. Cash remains 100%.");
             self.save_account_state(target_date, cash, 0.0, 0.0, 0.0)?;
@@ -254,7 +261,52 @@ impl PaperTradingEngine {
                 cash,
                 total_equity,
                 self.dry_run,
+                "조건검색 스코어 필터 통과 0.",
+                &[],
             );
+            let _ = sync_book(&self.cfg, &self.db_path);
+            return Ok(vec![]);
+        }
+
+        let (sized, skipped_picks, alloc_per_stock) =
+            size_overnight_picks(&picks, cash, self.cfg.max_alloc_per_ticker);
+        let skipped: Vec<serde_json::Value> = skipped_picks
+            .iter()
+            .map(|p| {
+                json!({
+                    "ticker": p.ticker,
+                    "stock_name": p.stock_name,
+                    "close_price": p.close_price,
+                    "price_source": p.price_source,
+                })
+            })
+            .collect();
+        if !skipped.is_empty() {
+            info!(
+                "[{target_date}] skipped {} name(s) over {:.0} KRW cap",
+                skipped.len(),
+                self.cfg.max_alloc_per_ticker
+            );
+        }
+        if sized.is_empty() {
+            let reason = format!(
+                "Top-{} 선정됐으나 종목당 {:.0}원 한도로 1주도 매수 불가 (고가 종목 스킵).",
+                picks.len(),
+                self.cfg.max_alloc_per_ticker
+            );
+            self.save_account_state(target_date, cash, 0.0, 0.0, 0.0)?;
+            let _ = send_market_close_buy_alert(
+                &self.cfg,
+                target_date,
+                &[],
+                alloc_per_stock,
+                cash,
+                total_equity,
+                self.dry_run,
+                &reason,
+                &skipped,
+            );
+            let _ = sync_book(&self.cfg, &self.db_path);
             return Ok(vec![]);
         }
 
@@ -272,10 +324,9 @@ impl PaperTradingEngine {
             }
         }
 
-        let alloc_per_stock = cash / picks.len() as f64;
         let mut bought = Vec::new();
         let mut total_buy_amount = 0.0;
-        let open_time = format!("{target_date} 15:30:00");
+        let open_time = format!("{target_date} 15:28:00");
 
         if !self.dry_run {
             let broker = if live {
@@ -284,14 +335,10 @@ impl PaperTradingEngine {
                 None
             };
             let conn = self.conn()?;
-            for p in &picks {
-                let qty = (alloc_per_stock / p.close_price).floor() as i64;
-                if qty <= 0 {
-                    continue;
-                }
+            for (p, qty, buy_amount) in &sized {
                 let mut buy_ord_no = String::new();
                 if let Some(ref broker) = broker {
-                    match broker.market_buy(&p.ticker, qty as i32) {
+                    match broker.market_buy(&p.ticker, *qty as i32) {
                         Ok((true, ord_no, _)) => buy_ord_no = ord_no,
                         Ok((false, _, msg)) => {
                             tracing::error!("LIVE BUY rejected {} qty={qty}: {msg}", p.ticker);
@@ -303,13 +350,12 @@ impl PaperTradingEngine {
                         }
                     }
                 }
-                let buy_amount = qty as f64 * p.close_price;
-                total_buy_amount += buy_amount;
+                total_buy_amount += *buy_amount;
                 conn.execute(
                     "INSERT INTO paper_trades (
                         date, ticker, stock_name, theme_name, buy_price, buy_qty, buy_amount,
-                        status, open_time, hybrid_score, p_lgb, p_torch, buy_ord_no, execution_mode
-                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,'OPEN',?8,?9,?10,?11,?12,?13)",
+                        status, open_time, hybrid_score, p_lgb, p_torch, buy_ord_no, execution_mode, trading_mode
+                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,'OPEN',?8,?9,?10,?11,?12,?13,?13)",
                     params![
                         target_date,
                         p.ticker,
@@ -336,16 +382,14 @@ impl PaperTradingEngine {
                     "hybrid_score": p.hybrid_score,
                     "p_lgb": p.p_lgb,
                     "p_torch": p.p_torch,
+                    "price_source": p.price_source,
+                    "exp_cntr_qty": p.exp_cntr_qty,
+                    "last_print": p.last_print,
                 }));
             }
         } else {
-            for p in &picks {
-                let qty = (alloc_per_stock / p.close_price).floor() as i64;
-                if qty <= 0 {
-                    continue;
-                }
-                let buy_amount = qty as f64 * p.close_price;
-                total_buy_amount += buy_amount;
+            for (p, qty, buy_amount) in &sized {
+                total_buy_amount += *buy_amount;
                 bought.push(json!({
                     "ticker": p.ticker,
                     "stock_name": p.stock_name,
@@ -356,6 +400,9 @@ impl PaperTradingEngine {
                     "hybrid_score": p.hybrid_score,
                     "p_lgb": p.p_lgb,
                     "p_torch": p.p_torch,
+                    "price_source": p.price_source,
+                    "exp_cntr_qty": p.exp_cntr_qty,
+                    "last_print": p.last_print,
                 }));
             }
             info!("[dry-run] would buy {} names, total={total_buy_amount:.0}", bought.len());
@@ -381,19 +428,24 @@ impl PaperTradingEngine {
             new_cash,
             total_equity,
             self.dry_run,
+            "",
+            &skipped,
         );
+        let _ = sync_book(&self.cfg, &self.db_path);
         Ok(bought)
     }
 
     pub fn execute_market_open_sell(&mut self, target_date: &str) -> Result<Vec<serde_json::Value>> {
+        apply_remote_trading_mode(&mut self.cfg);
         let conn = self.conn()?;
+        let mode = self.cfg.trading_mode.clone();
         let open_trades: Vec<(i64, String, String, f64, i64, f64, String)> = {
             let mut stmt = conn.prepare(
                 "SELECT id, ticker, stock_name, buy_price, buy_qty, buy_amount,
-                        COALESCE(execution_mode, 'paper')
-                 FROM paper_trades WHERE status = 'OPEN'",
+                        COALESCE(execution_mode, trading_mode, 'paper')
+                 FROM paper_trades WHERE status = 'OPEN' AND (trading_mode = ?1 OR execution_mode = ?1)",
             )?;
-            let mapped = stmt.query_map([], |r| {
+            let mapped = stmt.query_map([&mode], |r| {
                 Ok((
                     r.get(0)?,
                     r.get(1)?,
@@ -424,6 +476,7 @@ impl PaperTradingEngine {
                 equity,
                 self.dry_run,
             );
+            let _ = sync_book(&self.cfg, &self.db_path);
             return Ok(vec![]);
         }
 
@@ -483,6 +536,28 @@ impl PaperTradingEngine {
             None
         };
 
+        for (_, ticker, _, _, _, _, _) in &open_trades {
+            if open_price_map.get(ticker).copied().unwrap_or(0.0) > 0.0 {
+                continue;
+            }
+            if let Some(px) = crate::candles::open_from_day_db(&self.cfg.day_data_db, ticker, target_date)
+            {
+                info!("[{target_date}] T+1 open {ticker} from day_data_full.db = {px}");
+                open_price_map.insert(ticker.clone(), px);
+                continue;
+            }
+            if let Some(ref broker) = broker {
+                match broker.session_open(ticker) {
+                    Ok(px) if px > 0.0 => {
+                        info!("[{target_date}] T+1 open {ticker} from Kiwoom 시가 = {px}");
+                        open_price_map.insert(ticker.clone(), px);
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("[{target_date}] Kiwoom 시가 {ticker}: {e}"),
+                }
+            }
+        }
+
         let mut closed = Vec::new();
         let mut total_pnl_krw = 0.0;
         let mut total_returned_cash = 0.0;
@@ -503,19 +578,24 @@ impl PaperTradingEngine {
             if let Some(ref broker) = broker {
                 let held = broker.holding_qty(ticker).unwrap_or(0);
                 if held <= 0 {
-                    tracing::error!("LIVE SELL skip {ticker}: no broker holding");
-                    continue;
-                }
-                sell_qty = sell_qty.min(held);
-                match broker.market_sell(ticker, sell_qty as i32) {
-                    Ok((true, ord_no, _)) => sell_ord_no = ord_no,
-                    Ok((false, _, msg)) => {
-                        tracing::error!("LIVE SELL rejected {ticker}: {msg}");
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::error!("LIVE SELL error {ticker}: {e}");
-                        continue;
+                    // Manual flatten or already sold at broker: close the book, do not retry.
+                    tracing::warn!(
+                        "LIVE SELL {ticker}: broker qty=0, closing OPEN as MANUAL_FLAT"
+                    );
+                    sell_ord_no = "MANUAL_FLAT".into();
+                    sell_qty = *qty;
+                } else {
+                    sell_qty = sell_qty.min(held);
+                    match broker.market_sell(ticker, sell_qty as i32) {
+                        Ok((true, ord_no, _)) => sell_ord_no = ord_no,
+                        Ok((false, _, msg)) => {
+                            tracing::error!("LIVE SELL rejected {ticker}: {msg}");
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::error!("LIVE SELL error {ticker}: {e}");
+                            continue;
+                        }
                     }
                 }
             }
@@ -563,8 +643,8 @@ impl PaperTradingEngine {
         }
 
         let remaining_open: f64 = conn.query_row(
-            "SELECT COALESCE(SUM(buy_amount), 0.0) FROM paper_trades WHERE status = 'OPEN'",
-            [],
+            "SELECT COALESCE(SUM(buy_amount), 0.0) FROM paper_trades WHERE status = 'OPEN' AND (trading_mode = ?1 OR execution_mode = ?1)",
+            [mode],
             |r| r.get(0),
         )?;
         let leftover: f64 = conn
@@ -604,16 +684,18 @@ impl PaperTradingEngine {
             new_equity,
             self.dry_run,
         );
+        let _ = sync_book(&self.cfg, &self.db_path);
         Ok(closed)
     }
 
     pub fn run_post_market_parity_check(&mut self, target_date: &str) -> Result<bool> {
         let conn = self.conn()?;
         let like = format!("{target_date}%");
+        let mode = &self.cfg.trading_mode;
         let mut stmt =
-            conn.prepare("SELECT ticker FROM paper_trades WHERE date = ? AND open_time LIKE ?")?;
+            conn.prepare("SELECT ticker FROM paper_trades WHERE date = ? AND open_time LIKE ? AND (trading_mode = ?3 OR execution_mode = ?3)")?;
         let mut paper: Vec<String> = stmt
-            .query_map(params![target_date, like], |r| r.get(0))?
+            .query_map(params![target_date, like, mode], |r| r.get(0))?
             .filter_map(|r| r.ok())
             .collect();
         paper.sort();
@@ -622,14 +704,16 @@ impl PaperTradingEngine {
         let candidate_codes = self
             .condition_manager
             .get_condition_search_codes(target_date)?;
+        info!("[{target_date}] 18:00 parity scoring on completed daily bars (ka10081)");
         let picks = self.scorer.get_candidates_for_date(
             target_date,
             self.cfg.top_k,
-            2e10,
+            0.0,
             29.0,
             0.35,
             0.35,
             Some(&candidate_codes),
+            SessionCloseMode::Official,
         )?;
         let mut backtest: Vec<String> = picks.into_iter().map(|p| p.ticker).collect();
         backtest.sort();
@@ -671,11 +755,12 @@ impl PaperTradingEngine {
         let picks = self.scorer.get_candidates_for_date(
             target_date,
             top_k,
-            2e10,
+            0.0,
             29.0,
             0.35,
             0.35,
             Some(&codes),
+            SessionCloseMode::Official,
         )?;
         Ok((codes, picks))
     }

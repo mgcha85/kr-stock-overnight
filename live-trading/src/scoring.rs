@@ -28,6 +28,9 @@ pub struct Pick {
     pub hybrid_score: f64,
     pub news_count: usize,
     pub dart_count: usize,
+    pub exp_cntr_qty: f64,
+    pub price_source: String,
+    pub last_print: f64,
 }
 
 pub struct OvernightScorer {
@@ -62,6 +65,7 @@ impl OvernightScorer {
         min_p_lgb: f64,
         min_p_torch: f64,
         candidate_codes: Option<&[String]>,
+        close_mode: crate::quotes::SessionCloseMode,
     ) -> Result<Vec<Pick>> {
         let clean_candidates: Option<Vec<String>> =
             candidate_codes.map(|cs| cs.iter().map(|c| zfill6(c)).collect());
@@ -149,20 +153,7 @@ impl OvernightScorer {
             return Ok(vec![]);
         }
 
-        // theme_avg / max / count per (date, theme_idx, theme_name)
-        let mut theme_stats: HashMap<(String, i64, String), (f64, f64, usize)> = HashMap::new();
-        for j in &joined {
-            let key = (j.date.clone(), j.theme_idx, j.theme_name.clone());
-            let e = theme_stats.entry(key).or_insert((0.0, f64::NEG_INFINITY, 0));
-            e.0 += j.stock_change;
-            e.1 = e.1.max(j.stock_change);
-            e.2 += 1;
-        }
-        for v in theme_stats.values_mut() {
-            v.0 /= v.2 as f64;
-        }
-
-        // Candles last 45 days
+        // Candles last 45 days (exclude parquet today; inject Kiwoom session).
         let start_date = NaiveDate::parse_from_str(target_date, "%Y-%m-%d")
             .ok()
             .and_then(|d| d.checked_sub_signed(Duration::days(45)))
@@ -182,7 +173,7 @@ impl OvernightScorer {
                 );
         }
 
-        let candles = LazyFrame::scan_parquet(
+        let candles_raw = LazyFrame::scan_parquet(
             self.cfg.data_parquet.to_string_lossy().as_ref(),
             ScanArgsParquet::default(),
         )?
@@ -199,6 +190,46 @@ impl OvernightScorer {
             col("next_open"),
         ])
         .collect()?;
+
+        if candles_raw.height() == 0 {
+            return Ok(vec![]);
+        }
+
+        let score_codes: Vec<String> = if let Some(ref cands) = clean_candidates {
+            cands.clone()
+        } else {
+            hist.iter().map(|(_, c, _, _)| c.clone()).collect()
+        };
+        let session = crate::quotes::fetch_session_bars(&self.cfg, &score_codes, close_mode);
+        if session.is_empty() {
+            tracing::warn!(
+                "[score] no Kiwoom session bars mode={close_mode:?}; refusing parquet today={target_date}"
+            );
+        }
+        let hist_only = candles_raw
+            .lazy()
+            .filter(col("date").neq(lit(target_date)))
+            .collect()?;
+        let prev_close = last_close_by_code(&hist_only)?;
+        for j in &mut joined {
+            if let (Some(bar), Some(prev)) = (session.get(&j.code), prev_close.get(&j.code)) {
+                if *prev > 0.0 {
+                    j.stock_change = (bar.close / *prev - 1.0) * 100.0;
+                }
+            }
+        }
+        let mut theme_stats: HashMap<(String, i64, String), (f64, f64, usize)> = HashMap::new();
+        for j in &joined {
+            let key = (j.date.clone(), j.theme_idx, j.theme_name.clone());
+            let e = theme_stats.entry(key).or_insert((0.0, f64::NEG_INFINITY, 0));
+            e.0 += j.stock_change;
+            e.1 = e.1.max(j.stock_change);
+            e.2 += 1;
+        }
+        for v in theme_stats.values_mut() {
+            v.0 /= v.2 as f64;
+        }
+        let candles = inject_session_day(hist_only, target_date, &session)?;
 
         if candles.height() == 0 {
             return Ok(vec![]);
@@ -330,9 +361,9 @@ impl OvernightScorer {
         }
         let mut deduped: Vec<Scored> = best.into_values().collect();
 
-        // Filters
+        // Turnover is HTS/G+H universe, not this stage (live session bars often have turn=0).
         deduped.retain(|s| {
-            s.row.turnover >= min_turnover
+            (min_turnover <= 0.0 || s.row.turnover >= min_turnover)
                 && s.row.stock_change < max_stock_change
                 && s.p_lgb >= min_p_lgb
                 && s.p_torch >= min_p_torch
@@ -355,6 +386,7 @@ impl OvernightScorer {
                 market_context_counts(&self.cfg, &s.row.code, &s.row.stock_name, target_date);
             let aux_bonus = (dart_cnt as f64) * 5.0 + (news_cnt as f64) * 3.0;
             let final_score = s.hybrid + aux_bonus;
+            let sess = session.get(&s.row.code);
             results.push(Pick {
                 date: target_date.to_string(),
                 code: s.row.code.clone(),
@@ -369,6 +401,11 @@ impl OvernightScorer {
                 hybrid_score: final_score,
                 news_count: news_cnt,
                 dart_count: dart_cnt,
+                exp_cntr_qty: sess.map(|b| b.exp_cntr_qty).unwrap_or(0.0),
+                price_source: sess
+                    .map(|b| b.price_source.clone())
+                    .unwrap_or_else(|| "kiwoom".into()),
+                last_print: sess.map(|b| b.last_print).unwrap_or(s.row.close),
             });
         }
         Ok(results)
@@ -377,6 +414,88 @@ impl OvernightScorer {
 
 fn clip(x: f64, lo: f64, hi: f64) -> f64 {
     x.max(lo).min(hi)
+}
+
+fn last_close_by_code(hist: &DataFrame) -> Result<HashMap<String, f64>> {
+    let mut latest: HashMap<String, (String, f64)> = HashMap::new();
+    if hist.height() == 0 {
+        return Ok(HashMap::new());
+    }
+    let codes = hist.column("ticker")?.cast(&DataType::String)?;
+    let codes = codes.str()?;
+    let dates = hist.column("date")?.cast(&DataType::String)?;
+    let dates = dates.str()?;
+    let closes = hist.column("close")?.cast(&DataType::Float64)?;
+    let closes = closes.f64()?;
+    for i in 0..hist.height() {
+        let Some(t) = codes.get(i) else { continue };
+        let Some(d) = dates.get(i) else { continue };
+        let Some(c) = closes.get(i) else { continue };
+        let code = zfill6(t.split('.').next().unwrap_or(t));
+        let e = latest.entry(code).or_insert((d.to_string(), c));
+        if d > e.0.as_str() {
+            *e = (d.to_string(), c);
+        }
+    }
+    Ok(latest.into_iter().map(|(k, (_, c))| (k, c)).collect())
+}
+
+fn inject_session_day(
+    hist: DataFrame,
+    target_date: &str,
+    session: &HashMap<String, crate::quotes::SessionBar>,
+) -> Result<DataFrame> {
+    if session.is_empty() {
+        return Ok(hist);
+    }
+    let mut ticker_fmt: HashMap<String, String> = HashMap::new();
+    if hist.height() > 0 {
+        let codes = hist.column("ticker")?.cast(&DataType::String)?;
+        let codes = codes.str()?;
+        for i in 0..hist.height() {
+            if let Some(t) = codes.get(i) {
+                let code = zfill6(t.split('.').next().unwrap_or(t));
+                ticker_fmt.entry(code).or_insert_with(|| t.to_string());
+            }
+        }
+    }
+    let mut dates = Vec::new();
+    let mut tickers = Vec::new();
+    let mut opens = Vec::new();
+    let mut closes = Vec::new();
+    let mut highs = Vec::new();
+    let mut lows = Vec::new();
+    let mut turns = Vec::new();
+    let mut hcr = Vec::new();
+    let mut nxt = Vec::new();
+    for (code, bar) in session {
+        let ticker = ticker_fmt.get(code).cloned().unwrap_or_else(|| code.clone());
+        let hl = (bar.high - bar.low).max(1e-5);
+        dates.push(target_date.to_string());
+        tickers.push(ticker);
+        opens.push(bar.open);
+        closes.push(bar.close);
+        highs.push(bar.high);
+        lows.push(bar.low);
+        turns.push(bar.turnover);
+        hcr.push((bar.close - bar.low) / hl);
+        nxt.push(bar.close);
+    }
+    let today = DataFrame::new(vec![
+        Series::new("date".into(), dates).into(),
+        Series::new("ticker".into(), tickers).into(),
+        Series::new("open".into(), opens).into(),
+        Series::new("close".into(), closes).into(),
+        Series::new("high".into(), highs).into(),
+        Series::new("low".into(), lows).into(),
+        Series::new("turnover".into(), turns).into(),
+        Series::new("high_close_ratio".into(), hcr).into(),
+        Series::new("next_open".into(), nxt).into(),
+    ])?;
+    if hist.height() == 0 {
+        return Ok(today);
+    }
+    Ok(hist.vstack(&today)?)
 }
 
 fn col_f64(df: &DataFrame, name: &str, idx: usize) -> Option<f64> {

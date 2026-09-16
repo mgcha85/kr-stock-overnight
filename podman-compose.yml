@@ -1,11 +1,11 @@
 version: '3.8'
 
 services:
-  kr_stock_paper_trading:
+  kr_stock_live_trading:
     build:
       context: .
-      dockerfile: Dockerfile
-    container_name: kr_stock_paper_trading
+      dockerfile: Dockerfile.rust
+    container_name: kr_stock_live_trading
     restart: always
     volumes:
       - ./data:/app/data
@@ -14,7 +14,7 @@ services:
       - /mnt/data/projects/marketMosaic/backend/data:/mnt/data/projects/marketMosaic/backend/data:ro
       - /mnt/data/finance:/mnt/data/finance
     env_file:
-      - .env.${ENV_TYPE:-dev}
+      - .env.${ENV_TYPE:-prod}
     environment:
       - PYTHONPATH=/app/src:/app
     networks:

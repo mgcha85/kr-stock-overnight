@@ -1,0 +1,33 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install runtime system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    sqlite3 \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt-get/lists/*
+
+# Install minimal Python dependencies for candle sync (FinanceDataReader, polars, etc.)
+RUN pip install --no-cache-dir \
+    polars \
+    pandas \
+    pyarrow \
+    requests \
+    finance-datareader \
+    python-dotenv
+
+# Copy source, scripts, docs, and pre-compiled Rust release binary & models
+COPY src ./src
+COPY research ./research
+COPY scripts ./scripts
+COPY docs ./docs
+COPY live-trading/models ./live-trading/models
+COPY live-trading/target/release/trader ./live-trading/target/release/trader
+
+ENV PYTHONPATH=/app/src:/app
+ENV RUST_LOG=info
+
+# Default entrypoint command: Rust trader daemon (--dry-run false for live trading)
+CMD ["/app/live-trading/target/release/trader", "--dry-run", "false"]

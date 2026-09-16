@@ -1,17 +1,38 @@
 //! Kiwoom condition search manager — mirrors `kiwoom_condition.py`.
 
 use std::collections::HashSet;
+use std::future::Future;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{Duration, NaiveDate};
 use polars::prelude::*;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::Config;
+use crate::kiwoom::{fetch_condition_stocks, KiwoomAuth, KiwoomClient};
 
 pub struct KiwoomConditionManager {
     pub condition_name: String,
     cfg: Config,
+}
+
+fn block_on<T>(fut: impl Future<Output = T>) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+        Err(_) => tokio::runtime::Runtime::new()
+            .expect("tokio runtime")
+            .block_on(fut),
+    }
+}
+
+fn kiwoom_live_enabled() -> bool {
+    matches!(
+        std::env::var("KIWOOM_LIVE")
+            .unwrap_or_default()
+            .to_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
 }
 
 impl KiwoomConditionManager {
@@ -19,6 +40,60 @@ impl KiwoomConditionManager {
         Self {
             condition_name: condition_name.into(),
             cfg,
+        }
+    }
+
+    fn fetch_hts_condition_codes(&self) -> Option<Vec<String>> {
+        if !kiwoom_live_enabled() {
+            return None;
+        }
+        let app_key = std::env::var("KIWOOM_APP_KEY")
+            .or_else(|_| std::env::var("APP_KEY"))
+            .unwrap_or_default();
+        let secret = std::env::var("KIWOOM_SECRET_KEY")
+            .or_else(|_| std::env::var("SECRET_KEY"))
+            .unwrap_or_default();
+        if app_key.is_empty() || secret.is_empty() {
+            warn!("KIWOOM_LIVE=1 but APP_KEY/SECRET_KEY missing");
+            return None;
+        }
+        let client = KiwoomClient::from_env();
+        let token_path = std::env::var("KIWOOM_TOKEN_PATH").unwrap_or_else(|_| {
+            self.cfg
+                .paper_db
+                .with_file_name("kiwoom_access_token.json")
+                .display()
+                .to_string()
+        });
+        let auth = KiwoomAuth::new(client, app_key, secret).with_token_file(&token_path);
+        let token = match block_on(auth.ensure_token()) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("[Kiwoom LIVE] token: {e}");
+                return None;
+            }
+        };
+        let ws = KiwoomAuth::ws_url();
+        let names = [self.condition_name.clone()];
+        match block_on(fetch_condition_stocks(&names, &token, &ws)) {
+            Ok(codes) if !codes.is_empty() => {
+                let codes: Vec<String> = codes.into_iter().map(|c| zfill6(&c)).collect();
+                info!(
+                    "[Kiwoom LIVE] HTS '{}' returned {} candidates: {:?}",
+                    self.condition_name,
+                    codes.len(),
+                    codes
+                );
+                Some(codes)
+            }
+            Ok(_) => {
+                warn!("[Kiwoom LIVE] HTS '{}' returned 0 codes", self.condition_name);
+                None
+            }
+            Err(e) => {
+                warn!("[Kiwoom LIVE] HTS search failed: {e}");
+                None
+            }
         }
     }
 
@@ -88,38 +163,35 @@ impl KiwoomConditionManager {
             return Ok(codes);
         }
 
-        if let Some(live) = self.fetch_candidate_codes_from_api() {
-            return Ok(live);
-        }
+        let gh = {
+            info!(
+                "[Kiwoom Condition] Simulating '{}' condition for date: {}...",
+                self.condition_name, target_date
+            );
+            self.offline_fallback(target_date)?
+        };
 
-        info!(
-            "[Kiwoom Condition] Simulating '{}' condition for date: {}...",
-            self.condition_name, target_date
-        );
-        self.offline_fallback(target_date)
+        let live = self
+            .fetch_hts_condition_codes()
+            .or_else(|| self.fetch_candidate_codes_from_api());
+        if let Some(live) = live {
+            if !live.is_empty() {
+                info!(
+                    "[Kiwoom Condition] using live HTS {} codes (parquet G+H had {})",
+                    live.len(),
+                    gh.len()
+                );
+                return Ok(live);
+            }
+        }
+        Ok(gh)
     }
 
-    /// Offline A/B/C/D/E/H filters — identical to Python lines 108–124.
+    /// Offline HTS 「종가베팅」= G (open gap 2~28%) + H (turnover >= 200억).
     fn offline_fallback(&self, target_date: &str) -> Result<Vec<String>> {
-        let conn = rusqlite::Connection::open(&self.cfg.judal_db)
-            .with_context(|| format!("open judal {}", self.cfg.judal_db.display()))?;
-        let mut stmt = conn.prepare(
-            "SELECT code, change_rate as stock_change, neglect_index_52w
-             FROM stock_history WHERE crawl_date = ?",
-        )?;
-        let hist_rows: Vec<(String, f64)> = stmt
-            .query_map([target_date], |r| {
-                Ok((zfill6(&r.get::<_, String>(0)?), r.get::<_, f64>(1)?))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-        if hist_rows.is_empty() {
-            return Ok(vec![]);
-        }
-
         let start_date = NaiveDate::parse_from_str(target_date, "%Y-%m-%d")
             .ok()
-            .and_then(|d| d.checked_sub_signed(Duration::days(45)))
+            .and_then(|d| d.checked_sub_signed(Duration::days(10)))
             .map(|d| d.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "2026-01-01".into());
 
@@ -132,7 +204,13 @@ impl KiwoomConditionManager {
                 .gt_eq(lit(start_date.as_str()))
                 .and(col("date").lt_eq(lit(target_date))),
         )
-        .select([col("date"), col("ticker"), col("close"), col("turnover")])
+        .select([
+            col("date"),
+            col("ticker"),
+            col("open"),
+            col("close"),
+            col("turnover"),
+        ])
         .collect()?;
 
         if candles.height() == 0 {
@@ -146,97 +224,32 @@ impl KiwoomConditionManager {
                 ["code", "date"],
                 SortMultipleOptions::default().with_nulls_last(true),
             )
-            .with_columns([
-                col("close")
-                    .rolling_mean(RollingOptionsFixedWindow {
-                        window_size: 20,
-                        min_periods: 5,
-                        weights: None,
-                        center: false,
-                        fn_params: None,
-                    })
-                    .over([col("code")])
-                    .alias("sma_20"),
-                col("close")
-                    .rolling_min(RollingOptionsFixedWindow {
-                        window_size: 250,
-                        min_periods: 10,
-                        weights: None,
-                        center: false,
-                        fn_params: None,
-                    })
-                    .over([col("code")])
-                    .alias("low_52w"),
-            ])
+            .with_columns([col("close")
+                .shift(lit(1))
+                .over([col("code")])
+                .alias("prev_close")])
             .filter(col("date").eq(lit(target_date)))
-            .with_columns([col("turnover")
-                .rank(
-                    RankOptions {
-                        method: RankMethod::Average,
-                        descending: true,
-                    },
-                    None,
-                )
-                .alias("turnover_rank")])
+            .with_columns([((col("open") / col("prev_close")) - lit(1.0)).alias("open_gap")])
+            .filter(
+                col("turnover")
+                    .gt_eq(lit(2e10))
+                    .and(col("open_gap").is_not_null())
+                    .and(col("open_gap").gt_eq(lit(0.02)))
+                    .and(col("open_gap").lt_eq(lit(0.28))),
+            )
             .collect()?;
 
         if day.height() == 0 {
             return Ok(vec![]);
         }
 
-        let codes: Vec<String> = hist_rows.iter().map(|(c, _)| c.clone()).collect();
-        let changes: Vec<f64> = hist_rows.iter().map(|(_, ch)| *ch).collect();
-        let hist_df = DataFrame::new(vec![
-            Series::new("code".into(), codes).into(),
-            Series::new("stock_change".into(), changes).into(),
-        ])?;
-
-        let merged = day
-            .lazy()
-            .join(
-                hist_df.lazy(),
-                [col("code")],
-                [col("code")],
-                JoinArgs::new(JoinType::Inner),
-            )
-            .collect()?;
-
-        let codes_col = merged.column("code")?.str()?;
-        let turnover = merged.column("turnover")?.f64()?;
-        let stock_change = merged.column("stock_change")?.f64()?;
-        let close = merged.column("close")?.f64()?;
-        let turnover_rank = merged.column("turnover_rank")?.f64()?;
-        let low_52w = merged.column("low_52w")?.f64()?;
-        let sma_20 = merged.column("sma_20")?.f64()?;
-
-        let excl_suffixes: HashSet<char> =
-            ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'K', 'L', 'M']
-                .into_iter()
-                .collect();
-
+        let codes_col = day.column("code")?.str()?;
         let mut out: Vec<String> = Vec::new();
         let mut seen = HashSet::new();
-        for i in 0..merged.height() {
+        for i in 0..day.height() {
             let code = codes_col.get(i).unwrap_or("");
-            let t = turnover.get(i).unwrap_or(f64::NAN);
-            let ch = stock_change.get(i).unwrap_or(f64::NAN);
-            let c = close.get(i).unwrap_or(f64::NAN);
-            let tr = turnover_rank.get(i).unwrap_or(f64::NAN);
-            let lo = low_52w.get(i).unwrap_or(f64::NAN);
-            let sma = sma_20.get(i).unwrap_or(f64::NAN);
-
-            let cond_a = t >= 2e10;
-            let cond_b1 = (10.0..=28.5).contains(&ch);
-            let cond_b2 = ch >= 5.0 && t >= 5e10;
-            let cond_b = cond_b1 || cond_b2;
-            let cond_c = (2000.0..=500_000.0).contains(&c);
-            let cond_d = tr <= 150.0;
-            let cond_e = c > lo;
-            let cond_h = c > sma;
-            let last = code.chars().last().unwrap_or('\0');
-            let cond_excl = !excl_suffixes.contains(&last);
-
-            if cond_a && cond_b && cond_c && cond_d && cond_e && cond_h && cond_excl
+            if code.len() == 6
+                && code.chars().all(|ch| ch.is_ascii_digit())
                 && seen.insert(code.to_string())
             {
                 out.push(code.to_string());

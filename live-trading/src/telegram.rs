@@ -84,6 +84,34 @@ pub fn send_telegram_message(cfg: &Config, message: &str, dry_run: bool) -> Resu
     }
 }
 
+pub fn send_scheduler_boot_alert(cfg: &Config, now_kst: &str, dry_run: bool) -> Result<bool> {
+    let msg = format!(
+        "<b>🟢 [{}] [KRX Overnight] 스케줄러 기동</b>\n\
+         🗓️ <b>시각:</b> {now_kst}\n\
+         📌 평일 09:00 매도 / 15:28 매수 (0건이어도 리포트)\n\
+         📌 창을 놓치면 당일 따라잡기 (매수는 16:00 전까지)",
+        mode_tag(cfg)
+    );
+    send_telegram_message(cfg, &msg, dry_run)
+}
+
+pub fn send_missed_window_alert(
+    cfg: &Config,
+    date_str: &str,
+    title: &str,
+    details: &str,
+    dry_run: bool,
+) -> Result<bool> {
+    let msg = format!(
+        "<b>⚠️ [{}] [KRX Overnight] {title}</b>\n\
+         🗓️ <b>일자:</b> {date_str}\n\
+         ────────────────────────\n\
+         {details}",
+        mode_tag(cfg)
+    );
+    send_telegram_message(cfg, &msg, dry_run)
+}
+
 pub fn send_ops_error_alert(cfg: &Config, date_str: &str, title: &str, details: &str, dry_run: bool) -> Result<bool> {
     let msg = format!(
         "<b>🚨 [{}] [KRX Overnight] {title}</b>\n\
@@ -105,10 +133,12 @@ pub fn send_market_close_buy_alert(
     cash_remaining: f64,
     total_equity: f64,
     dry_run: bool,
+    empty_reason: &str,
+    skipped: &[serde_json::Value],
 ) -> Result<bool> {
     let mut lines = vec![
         format!(
-            "<b>📈 [{}] [KRX Overnight Strategy] 장 마감 매수 내역 (15:20)</b>",
+            "<b>📈 [{}] [KRX Overnight Strategy] 장 마감 매수 내역 (15:28)</b>",
             mode_tag(cfg)
         ),
         format!("🗓️ <b>일자:</b> {date_str}"),
@@ -119,12 +149,50 @@ pub fn send_market_close_buy_alert(
         ),
         "────────────────────────".into(),
     ];
+    if !skipped.is_empty() {
+        lines.push(format!(
+            "⏭️ <b>종목당 {}원 한도로 제외</b>",
+            fmt_int(cfg.max_alloc_per_ticker)
+        ));
+        for s in skipped {
+            lines.push(format!(
+                "   • {} ({}) {}원",
+                s["stock_name"].as_str().unwrap_or(""),
+                s["ticker"].as_str().unwrap_or(""),
+                fmt_int(s["close_price"].as_f64().unwrap_or(0.0)),
+            ));
+        }
+        lines.push("────────────────────────".into());
+    }
     if buys.is_empty() {
-        lines.push("⚠️ <b>매수 조건 충족 종목 없음 (Cash 100% 보유)</b>".into());
+        if empty_reason.is_empty() {
+            lines.push("⚠️ <b>매수 조건 충족 종목 없음 (Cash 100% 보유)</b>".into());
+        } else {
+            lines.push(format!("⚠️ <b>매수 없음</b>\n   {empty_reason}"));
+        }
     } else {
         for (idx, b) in buys.iter().enumerate() {
+            let src = b.get("price_source").and_then(|v| v.as_str()).unwrap_or("");
+            let price_label = if src.is_empty() || src == "last_print_fallback" {
+                "매수가"
+            } else {
+                "매수가(예상체결가)"
+            };
+            let mut extra = String::new();
+            if src != "last_print_fallback" && !src.is_empty() {
+                if let Some(lp) = b.get("last_print").and_then(|v| v.as_f64()) {
+                    if lp > 0.0 {
+                        extra.push_str(&format!("  [last {}]", fmt_int(lp)));
+                    }
+                }
+                if let Some(q) = b.get("exp_cntr_qty").and_then(|v| v.as_f64()) {
+                    if q > 0.0 {
+                        extra.push_str(&format!("\n   • 예상체결수량: {} 주", fmt_int(q)));
+                    }
+                }
+            }
             lines.push(format!(
-                "<b>{}. {} ({})</b>\n   • 테마: {}\n   • 매수가(종가): {} 원\n   • 수량: {} 주 (총 {} 원)\n   • 모델점수: {:.1}점 (LGB: {:.2} | DL: {:.2})",
+                "<b>{}. {} ({})</b>\n   • 테마: {}\n   • {price_label}: {} 원{extra}\n   • 수량: {} 주 (총 {} 원)\n   • 모델점수: {:.1}점 (LGB: {:.2} | DL: {:.2})",
                 idx + 1,
                 b["stock_name"].as_str().unwrap_or(""),
                 b["ticker"].as_str().unwrap_or(""),
@@ -239,7 +307,7 @@ pub fn send_parity_check_alert(
         details.to_string()
     };
     let msg = format!(
-        "<b>{status} [{}] 장후 백테스트 ↔ 페이퍼트레이딩 검증 보고</b>\n\
+        "<b>{status} [{}] 18:00 확정일봉 ↔ 라이브매수 검증 보고</b>\n\
          🗓️ <b>검증 일자:</b> {date_str}\n\
          📌 <b>Paper Trading 매수:</b> {paper}\n\
          🔍 <b>Backtest 정답 매수:</b> {back}\n\

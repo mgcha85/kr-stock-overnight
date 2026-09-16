@@ -149,8 +149,8 @@ def upsert_parquet_from_listing(df_listing: pd.DataFrame, target_date_str: str) 
                 "low": low_p,
                 "close": close_p,
                 "volume": volume_v,
-                "open_time": pd.Timestamp(f"{target_date_str} 09:00:00"),
-                "close_time": pd.Timestamp(f"{target_date_str} 15:30:00"),
+                "open_time": datetime.datetime.strptime(f"{target_date_str} 09:00:00", "%Y-%m-%d %H:%M:%S"),
+                "close_time": datetime.datetime.strptime(f"{target_date_str} 15:30:00", "%Y-%m-%d %H:%M:%S"),
                 "ticker": code,
                 "market": market,
                 "full_symbol": f"{code}.{market}",
@@ -166,7 +166,7 @@ def upsert_parquet_from_listing(df_listing: pd.DataFrame, target_date_str: str) 
     if not records:
         raise RuntimeError(f"No valid listing rows to write into parquet for {target_date_str}")
 
-    today_df = pl.from_pandas(pd.DataFrame(records)).with_columns(
+    today_df = pl.DataFrame(records).with_columns(
         [
             pl.col("open").cast(pl.Float64),
             pl.col("high").cast(pl.Float64),

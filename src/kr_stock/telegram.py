@@ -10,8 +10,13 @@ Sends real-time alerts for:
 
 import requests
 import logging
-from typing import List, Dict, Any
-from kr_stock.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, execution_mode_tag
+from typing import List, Dict, Any, Optional
+from kr_stock.config import (
+    MAX_ALLOC_PER_TICKER,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
+    execution_mode_tag,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +49,26 @@ def send_telegram_message(message: str) -> bool:
         return False
 
 
+def send_scheduler_boot_alert(now_kst: str) -> bool:
+    msg = (
+        f"<b>🟢 [{execution_mode_tag()}] [KRX Overnight] 스케줄러 기동</b>\n"
+        f"🗓️ <b>시각:</b> {now_kst}\n"
+        "📌 평일 09:00 매도 / 15:28 매수 (0건이어도 리포트)\n"
+        "📌 창을 놓치면 당일 따라잡기 (매수는 16:00 전까지)"
+    )
+    return send_telegram_message(msg)
+
+
+def send_missed_window_alert(date_str: str, title: str, details: str) -> bool:
+    msg = (
+        f"<b>⚠️ [{execution_mode_tag()}] [KRX Overnight] {title}</b>\n"
+        f"🗓️ <b>일자:</b> {date_str}\n"
+        "────────────────────────\n"
+        f"{details}"
+    )
+    return send_telegram_message(msg)
+
+
 def send_ops_error_alert(date_str: str, title: str, details: str) -> bool:
     """Failure that must not be reported as a normal empty-buy / fee-only sell."""
     msg = (
@@ -64,14 +89,25 @@ def send_market_close_buy_alert(
     cash_remaining: float,
     total_equity: float,
     empty_reason: str = "",
+    skipped: Optional[List[Dict[str, Any]]] = None,
 ) -> bool:
     """Formats and sends the 15:20 Market Close BUY notification."""
     lines = [
-        f"<b>📈 [{execution_mode_tag()}] [KRX Overnight Strategy] 장 마감 매수 내역 (15:20)</b>",
+        f"<b>📈 [{execution_mode_tag()}] [KRX Overnight Strategy] 장 마감 매수 내역 (15:28)</b>",
         f"🗓️ <b>일자:</b> {date_str}",
         f"💵 <b>설정 시드:</b> {total_equity:,.0f} 원 | <b>종목당 배정:</b> {capital_per_stock:,.0f} 원",
         "────────────────────────"
     ]
+
+    if skipped:
+        lines.append(f"⏭️ <b>종목당 {MAX_ALLOC_PER_TICKER:,.0f}원 한도로 제외</b>")
+        for s in skipped:
+            price = float(s.get("close_price") or s.get("buy_price") or 0.0)
+            lines.append(
+                f"   • {s.get('stock_name', '')} ({s.get('ticker', '')}) "
+                f"{price:,.0f}원"
+            )
+        lines.append("────────────────────────")
 
     if not buys:
         if empty_reason:
@@ -80,10 +116,23 @@ def send_market_close_buy_alert(
             lines.append("⚠️ <b>매수 조건 충족 종목 없음 (필터 통과 종목 0)</b>")
     else:
         for idx, b in enumerate(buys, 1):
+            src = str(b.get("price_source") or "")
+            price_label = "매수가(예상체결가)" if src and src != "last_print_fallback" else "매수가"
+            extra_last = (
+                f"  [last {float(b.get('last_print') or 0):,.0f}]"
+                if src and src != "last_print_fallback" and b.get("last_print")
+                else ""
+            )
+            extra_qty = (
+                f"\n   • 예상체결수량: {float(b.get('exp_cntr_qty') or 0):,.0f} 주"
+                if b.get("exp_cntr_qty")
+                else ""
+            )
             lines.append(
                 f"<b>{idx}. {b['stock_name']} ({b['ticker']})</b>\n"
                 f"   • 테마: {b.get('theme_name', 'N/A')}\n"
-                f"   • 매수가(종가): {b['buy_price']:,.0f} 원\n"
+                f"   • {price_label}: {b['buy_price']:,.0f} 원{extra_last}"
+                f"{extra_qty}\n"
                 f"   • 수량: {b['buy_qty']:,} 주 (총 {b['buy_amount']:,.0f} 원)\n"
                 f"   • 모델점수: {b.get('hybrid_score', 0):.1f}점 (LGB: {b.get('p_lgb', 0):.2f} | DL: {b.get('p_torch', 0):.2f})"
             )

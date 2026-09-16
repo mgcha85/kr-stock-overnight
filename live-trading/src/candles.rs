@@ -1,26 +1,35 @@
-//! Candle availability check for parity — FDR sync remains Python-side.
+//! Candle availability check. Live scoring uses Kiwoom session bars, not FDR.
 
 use anyhow::{bail, Context, Result};
 use polars::prelude::*;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::config::Config;
 
-/// Ensure parquet contains rows for `date`.
-///
-/// FDR/KRX candle sync is intentionally Python
-/// (`scripts/fetch_today_kr_candles.py` → rebuilds `kr_kline_processed.parquet`).
-/// Rust validates presence for parity; optionally probes `day_data_full.db`.
+/// History parquet must exist. Today's bar is injected from Kiwoom at score time.
 pub fn ensure_today_updated(cfg: &Config, date: &str) -> Result<()> {
     if !cfg.data_parquet.exists() {
         bail!(
-            "parquet missing at {}. Run: PYTHONPATH=src python scripts/fetch_today_kr_candles.py --date {}",
-            cfg.data_parquet.display(),
-            date
+            "parquet missing at {}. History required for kline features.",
+            cfg.data_parquet.display()
         );
     }
 
-    let count = LazyFrame::scan_parquet(
+    let hist = LazyFrame::scan_parquet(
+        cfg.data_parquet.to_string_lossy().as_ref(),
+        ScanArgsParquet::default(),
+    )?
+    .select([len().alias("n")])
+    .collect()?
+    .column("n")?
+    .u32()?
+    .get(0)
+    .unwrap_or(0);
+    if hist == 0 {
+        bail!("parquet is empty at {}", cfg.data_parquet.display());
+    }
+
+    let today_n = LazyFrame::scan_parquet(
         cfg.data_parquet.to_string_lossy().as_ref(),
         ScanArgsParquet::default(),
     )?
@@ -31,54 +40,31 @@ pub fn ensure_today_updated(cfg: &Config, date: &str) -> Result<()> {
     .u32()?
     .get(0)
     .unwrap_or(0);
-
-    if count > 0 {
-        info!("[candles] parquet has {count} rows for {date}");
-        return Ok(());
-    }
-
-    // Fallback probe: day_data_full.db may have today's bars even if parquet is stale.
-    if cfg.day_data_db.exists() {
-        match probe_day_data_db(&cfg.day_data_db, date) {
-            Ok(n) if n > 0 => {
-                warn!(
-                    "[candles] parquet missing {date} but day_data_full.db has ~{n} tables with that date. \
-                     Rebuild parquet via: PYTHONPATH=src python scripts/fetch_today_kr_candles.py --date {date}"
-                );
-                bail!(
-                    "parquet missing rows for {date} (day_data_full.db appears populated). \
-                     Run Python fetch script to rebuild kr_kline_processed.parquet."
-                );
-            }
-            Ok(_) => {}
-            Err(e) => warn!("[candles] day_data_full.db probe failed: {e}"),
-        }
-    }
-
-    bail!(
-        "No candle rows for {date} in {}. \
-         FDR sync is Python-only — run: PYTHONPATH=src python scripts/fetch_today_kr_candles.py --date {date}",
-        cfg.data_parquet.display()
+    info!(
+        "[candles] parquet history ok ({hist} rows); today={date} parquet_rows={today_n} (ignored for live score)"
     );
+    Ok(())
 }
 
-fn probe_day_data_db(path: &std::path::Path, date: &str) -> Result<usize> {
-    let conn = rusqlite::Connection::open(path)
-        .with_context(|| format!("open {}", path.display()))?;
-    let mut stmt = conn.prepare(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%.%' LIMIT 50",
-    )?;
-    let tables: Vec<String> = stmt
-        .query_map([], |r| r.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
-    let mut hits = 0usize;
-    for t in tables {
-        let sql = format!(r#"SELECT 1 FROM "{t}" WHERE date = ? LIMIT 1"#);
-        let found: Result<i64, _> = conn.query_row(&sql, [date], |r| r.get(0));
-        if found.is_ok() {
-            hits += 1;
+/// Open from `day_data_full.db` when parquet has no row for the ticker.
+pub fn open_from_day_db(db: &std::path::Path, ticker: &str, date: &str) -> Option<f64> {
+    if !db.exists() {
+        return None;
+    }
+    let conn = rusqlite::Connection::open(db)
+        .with_context(|| format!("open {}", db.display()))
+        .ok()?;
+    let code = crate::condition::zfill6(ticker);
+    for suffix in [".KQ", ".KS"] {
+        let table = format!("{code}{suffix}");
+        let sql = format!(
+            r#"SELECT open FROM "{table}" WHERE date = ? ORDER BY rowid DESC LIMIT 1"#
+        );
+        if let Ok(px) = conn.query_row(&sql, [date], |r| r.get::<_, f64>(0)) {
+            if px > 0.0 {
+                return Some(px);
+            }
         }
     }
-    Ok(hits)
+    None
 }

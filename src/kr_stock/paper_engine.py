@@ -6,7 +6,6 @@ Telegram alerts, weekly/monthly return tracking, and post-market backtest parity
 """
 
 import sqlite3
-import math
 import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Tuple
@@ -15,8 +14,10 @@ from pathlib import Path
 
 from kr_stock.config import (
     PAPER_DB_PATH, SEED_CAPITAL, TOP_K_TRADES, FEE_RATE, DATA_PARQUET_PATH,
-    TRADING_MODE, ACC_NO, is_live_execution,
+    TRADING_MODE, ACC_NO, MAX_ALLOC_PER_TICKER, is_live_execution,
 )
+from kr_stock.sizing import size_overnight_picks
+from kr_stock.dashboard_live import apply_remote_trading_mode, sync_book
 from kr_stock.inference import OvernightScorer
 from kr_stock.kiwoom_condition import KiwoomConditionManager
 from kr_stock.telegram import (
@@ -192,14 +193,56 @@ class PaperTradingEngine:
 
         return weekly_pct, monthly_pct
 
+    def abort_open_trades(self, mode: str = "paper") -> int:
+        """Close OPEN rows for `mode` in SQLite only. Never sends a broker order."""
+        close_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        self._ensure_trade_columns(cursor)
+        rows = cursor.execute(
+            """
+            SELECT id, buy_price, buy_amount FROM paper_trades
+            WHERE status = 'OPEN'
+              AND COALESCE(trading_mode, execution_mode, 'paper') = ?
+            """,
+            (mode,),
+        ).fetchall()
+        for trade_id, buy_price, buy_amount in rows:
+            cursor.execute(
+                """
+                UPDATE paper_trades SET
+                    sell_price = ?,
+                    sell_amount = ?,
+                    pnl_krw = 0.0,
+                    pnl_pct = 0.0,
+                    status = 'CLOSED',
+                    close_time = ?,
+                    sell_ord_no = 'ABORT_DB_ONLY'
+                WHERE id = ?
+                """,
+                (buy_price, buy_amount, close_time, trade_id),
+            )
+        n = len(rows)
+        remaining = cursor.execute(
+            "SELECT COALESCE(SUM(buy_amount), 0.0) FROM paper_trades WHERE status = 'OPEN'"
+        ).fetchone()[0]
+        conn.commit()
+        conn.close()
+        today = datetime.now().strftime("%Y-%m-%d")
+        self._save_account_state(today, SEED_CAPITAL, remaining)
+        logger.info("[abort] closed %s %s OPEN trade(s); invested left=%.0f", n, mode, remaining)
+        sync_book(self.db_path)
+        return n
+
     def execute_market_close_buy(self, target_date: str) -> List[Dict[str, Any]]:
         """
-        [15:20 Market Close]
+        [15:28 Market Close]
         1. Selects Top-K picks using OvernightScorer.
-        2. Allocates available cash.
-        3. Executes Paper BUY orders.
-        4. Sends Telegram notification.
+        2. Caps each name at MAX_ALLOC_PER_TICKER (skip if 1 share would exceed).
+        3. Executes BUY orders only when TRADING_MODE=live. Paper writes the same DB rows.
+        4. Sends Telegram notification and syncs 8082.
         """
+        apply_remote_trading_mode()
         live = is_live_execution()
         if live:
             try:
@@ -239,17 +282,17 @@ class PaperTradingEngine:
             logger.error(f"[{target_date}] Candle sync FAILED: {e}", exc_info=True)
             send_ops_error_alert(
                 target_date,
-                "15:20 캔들 동기화 실패 — 매수 중단",
+                "15:28 캔들 동기화 실패 — 매수 중단",
                 f"<code>{e}</code>\n컨테이너에 FinanceDataReader가 없거나 parquet가 비면 "
                 "종가 스코어링이 0건이 됩니다. 가짜 '매수 조건 충족 종목 없음'은 보내지 않습니다.",
             )
             return []
 
-        # 1. Fetch candidate codes matching Kiwoom Condition Search ("종가베팅")
+        # 1. HTS 「종가베팅」= 백테스트 하드 필터. 2. 그 안에서 주달+ML Top-3.
         candidate_codes = self.condition_manager.get_condition_search_codes(target_date)
-        
-        # 2. Score only these matched candidates
-        picks = self.scorer.get_candidates_for_date(target_date, top_k=TOP_K_TRADES, candidate_codes=candidate_codes)
+        picks = self.scorer.get_candidates_for_date(
+            target_date, top_k=TOP_K_TRADES, candidate_codes=candidate_codes
+        )
 
         if not picks:
             reason = (
@@ -259,10 +302,39 @@ class PaperTradingEngine:
             logger.info(f"[{target_date}] No candidates met scoring threshold. {reason}")
             self._save_account_state(target_date, cash, 0.0)
             send_market_close_buy_alert(target_date, [], 0.0, cash, total_equity, empty_reason=reason)
+            sync_book(self.db_path)
             return []
 
-        # Split available cash equally across picks
-        alloc_per_stock = cash / len(picks)
+        # 15:20–15:30 last trade is frozen; size and record the live auction expected match.
+        try:
+            from kr_stock.kiwoom_quote import overlay_expected_match
+            picks = overlay_expected_match(picks)
+        except Exception as e:
+            logger.error(f"[{target_date}] ka10004 예상체결 조회 실패, last print 유지: {e}", exc_info=True)
+
+        sized, skipped, alloc_per_stock = size_overnight_picks(picks, cash, MAX_ALLOC_PER_TICKER)
+        if skipped:
+            logger.info(
+                "[%s] skipped %s name(s) over %.0f KRW cap: %s",
+                target_date,
+                len(skipped),
+                MAX_ALLOC_PER_TICKER,
+                [(s.get("ticker"), s.get("close_price"), s.get("skip_reason")) for s in skipped],
+            )
+        if not sized:
+            reason = (
+                f"Top-{len(picks)} 선정됐으나 종목당 {MAX_ALLOC_PER_TICKER:,.0f}원 한도로 "
+                f"1주도 매수 불가 (고가 종목 스킵)."
+            )
+            logger.info(f"[{target_date}] {reason}")
+            self._save_account_state(target_date, cash, 0.0)
+            send_market_close_buy_alert(
+                target_date, [], alloc_per_stock, cash, total_equity,
+                empty_reason=reason, skipped=skipped,
+            )
+            sync_book(self.db_path)
+            return []
+
         bought_trades = []
         conn = sqlite3.connect(str(self.db_path))
         cursor = conn.cursor()
@@ -270,9 +342,9 @@ class PaperTradingEngine:
 
         total_buy_amount = 0.0
         rejected = []
-        for p in picks:
+        for p in sized:
             close_price = p['close_price']
-            qty = math.floor(alloc_per_stock / close_price)
+            qty = int(p['buy_qty'])
             if qty <= 0:
                 continue
 
@@ -289,7 +361,7 @@ class PaperTradingEngine:
 
             buy_amount = qty * close_price
             total_buy_amount += buy_amount
-            open_time_str = f"{target_date} 15:20:00"
+            open_time_str = f"{target_date} 15:28:00"
 
             cursor.execute("""
                 INSERT INTO paper_trades (
@@ -313,6 +385,9 @@ class PaperTradingEngine:
                 "hybrid_score": p['hybrid_score'],
                 "p_lgb": p['p_lgb'],
                 "p_torch": p['p_torch'],
+                "price_source": p.get("price_source", ""),
+                "exp_cntr_qty": p.get("exp_cntr_qty", 0),
+                "last_print": p.get("last_print"),
             })
 
         conn.commit()
@@ -337,7 +412,11 @@ class PaperTradingEngine:
             new_cash = cash - total_buy_amount
         self._save_account_state(target_date, new_cash, total_buy_amount)
 
-        send_market_close_buy_alert(target_date, bought_trades, alloc_per_stock, new_cash, total_equity)
+        send_market_close_buy_alert(
+            target_date, bought_trades, alloc_per_stock, new_cash, total_equity,
+            skipped=skipped,
+        )
+        sync_book(self.db_path)
         return bought_trades
 
     def execute_market_open_sell(self, target_date: str) -> List[Dict[str, Any]]:
@@ -348,6 +427,7 @@ class PaperTradingEngine:
         3. Closes positions and updates account balance.
         4. Calculates Weekly & Monthly returns and sends Telegram report.
         """
+        apply_remote_trading_mode()
         conn = sqlite3.connect(str(self.db_path))
         cursor = conn.cursor()
         self._ensure_trade_columns(cursor)
@@ -365,6 +445,7 @@ class PaperTradingEngine:
             cash, invested, equity = self.get_latest_account_state()
             w_pct, m_pct = self.calculate_cumulative_returns(target_date, equity)
             send_market_open_sell_alert(target_date, [], 0.0, 0.0, w_pct, m_pct, equity)
+            sync_book(self.db_path)
             return []
 
         live = is_live_execution()
@@ -549,7 +630,7 @@ class PaperTradingEngine:
             target_date, closed_trades, total_pnl_krw, daily_pct,
             weekly_pct, monthly_pct, new_equity
         )
-
+        sync_book(self.db_path)
         return closed_trades
 
     def run_post_market_parity_check(self, target_date: str) -> bool:
@@ -570,9 +651,10 @@ class PaperTradingEngine:
 
         paper_tickers = sorted(list(set([r[0] for r in paper_rows])))
 
-        # Fetch backtest signals for target_date using Kiwoom Condition Search
         candidate_codes = self.condition_manager.get_condition_search_codes(target_date)
-        backtest_picks = self.scorer.get_candidates_for_date(target_date, top_k=TOP_K_TRADES, candidate_codes=candidate_codes)
+        backtest_picks = self.scorer.get_candidates_for_date(
+            target_date, top_k=TOP_K_TRADES, candidate_codes=candidate_codes
+        )
         backtest_tickers = sorted([p['ticker'] for p in backtest_picks])
 
         is_matched = (paper_tickers == backtest_tickers)

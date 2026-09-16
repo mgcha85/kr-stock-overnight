@@ -26,6 +26,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "8516370855")
 SEED_CAPITAL = float(os.getenv("SEED_CAPITAL", "10000000"))  # 10,000,000 KRW
 TOP_K_TRADES = int(os.getenv("TOP_K_TRADES", "3"))
 FEE_RATE = float(os.getenv("FEE_RATE", "0.0023"))  # 0.23% round-trip fee & tax
+MAX_ALLOC_PER_TICKER = float(os.getenv("MAX_ALLOC_PER_TICKER", "500000"))  # KRW hard cap
+OVERNIGHT_API_URL = os.getenv("OVERNIGHT_API_URL", "http://146.56.115.71:8082/api/overnight")
 
 # Database & Storage Paths
 DATA_DIR = ROOT_DIR / "data"
@@ -47,6 +49,14 @@ if str(os.getenv("EXECUTION_LIVE", "0")).strip().lower() in {"1", "true", "yes",
     _TRADING_MODE_RAW = "live"
 TRADING_MODE = "live" if _TRADING_MODE_RAW in {"live", "on", "1", "true"} else "paper"
 ACC_NO = os.getenv("ACC_NO") or os.getenv("ACC_ID") or os.getenv("KIWOOM_ACC_NO") or ""
+
+
+def set_trading_mode(mode: str) -> str:
+    """Runtime override used by the 8082 live/paper toggle. Does not rewrite .env."""
+    global TRADING_MODE
+    raw = str(mode or "").strip().lower()
+    TRADING_MODE = "live" if raw in {"live", "on", "1", "true"} else "paper"
+    return TRADING_MODE
 
 
 def is_live_execution() -> bool:

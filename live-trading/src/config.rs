@@ -5,8 +5,16 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-/// Project root: parent of the crate (`CARGO_MANIFEST_DIR/..` → `kr_stock/`).
+/// Project root: checked at runtime (supports both host & Docker container).
 pub fn root_dir() -> PathBuf {
+    if let Ok(dir) = env::current_dir() {
+        if dir.join("live-trading").exists() {
+            return dir;
+        }
+        if dir.join("models").exists() {
+            return dir.parent().map(Path::to_path_buf).unwrap_or(dir);
+        }
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .map(Path::to_path_buf)
@@ -36,6 +44,8 @@ pub struct Config {
     pub seed_capital: f64,
     pub top_k: usize,
     pub fee_rate: f64,
+    pub max_alloc_per_ticker: f64,
+    pub overnight_api_url: String,
     pub env_type: String,
     /// `paper` (DB fills) or `live` (Kiwoom kt10000/kt10001).
     pub trading_mode: String,
@@ -59,7 +69,11 @@ impl Config {
         let _ = dotenvy::dotenv();
 
         let data_dir = root.join("data");
-        let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models");
+        let model_dir = if root.join("live-trading/models").exists() {
+            root.join("live-trading/models")
+        } else {
+            root.join("models")
+        };
 
         Ok(Self {
             root_dir: root.clone(),
@@ -107,6 +121,11 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(FEE_RATE),
+            max_alloc_per_ticker: env::var("MAX_ALLOC_PER_TICKER")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(500_000.0),
+            overnight_api_url: overnight_api_url(),
             env_type,
             trading_mode: parse_trading_mode(),
             acc_no: env::var("ACC_NO")
@@ -121,19 +140,35 @@ impl Config {
     }
 
     pub fn lgb_model_path(&self) -> PathBuf {
-        self.model_dir.join("lgb_kline_model.txt")
+        env_path("LGB_MODEL_PATH", self.model_dir.join("lgb_kline_model.txt"))
     }
 
     pub fn scaler_path(&self) -> PathBuf {
-        self.model_dir.join("kline_scaler.json")
+        env_path("SCALER_PATH", self.model_dir.join("kline_scaler.json"))
     }
 
     pub fn onnx_model_path(&self) -> PathBuf {
-        self.model_dir.join("pytorch_kline_model.onnx")
+        env_path("ONNX_MODEL_PATH", self.model_dir.join("pytorch_kline_model.onnx"))
     }
 
     pub fn roundtrip_path(&self) -> PathBuf {
-        self.model_dir.join("roundtrip_vectors.json")
+        env_path("ROUNDTRIP_VECTORS_PATH", self.model_dir.join("roundtrip_vectors.json"))
+    }
+}
+
+fn overnight_api_url() -> String {
+    if let Ok(v) = env::var("OVERNIGHT_API_URL") {
+        let trimmed = v.trim().trim_end_matches('/').to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    let dash = env::var("DASHBOARD_API_URL")
+        .unwrap_or_else(|_| "http://146.56.115.71:8082/api/backtest".into());
+    if let Some(idx) = dash.find("/api/") {
+        format!("{}/api/overnight", &dash[..idx])
+    } else {
+        "http://146.56.115.71:8082/api/overnight".into()
     }
 }
 
@@ -157,8 +192,7 @@ fn env_path(key: &str, default: PathBuf) -> PathBuf {
     match env::var(key) {
         Ok(v) => {
             let p = PathBuf::from(&v);
-            // Container paths from .env.dev are invalid on host — fall back.
-            if p.exists() || !v.starts_with("/app/") {
+            if p.exists() {
                 p
             } else {
                 default
